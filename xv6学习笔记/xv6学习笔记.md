@@ -292,7 +292,7 @@ QEMU ROM (0x1000) → OpenSBI (M模式) → 加载内核到 0x80000000
 
 ## 2.系统调用
 
-![alt text](image.png)
+![alt text](系统调用.png)
 
 ### 2.1 **用户态：发起系统调用**
 
@@ -738,3 +738,250 @@ userret:
 7. **文件系统操作**：fileread() → readi() → 缓冲区缓存 → 磁盘读取
 8. **准备返回**：usertrapret()设置返回环境
 9. **恢复上下文**：userret 恢复用户寄存器 → sret 返回用户空间
+
+## 3.页表
+
+![alt text](<页表.png>)
+
+
+### 3.1 物理页分配
+
+在xv6启动流程中，在开启分页机制之前，需要先对物理内存（128M）进行分配。xv6中的`kernel/kalloc.c`包括对物理内存的初始化、分配、回收等等。
+```c
+// end是声明在kernel.ld中的符号，位置在.bss段的末尾，也就是kernel文件的最后面。
+// 通过objdump工具可以查看end地址为：0x0000000080021d30
+extern char end[];   
+
+// 链表指针，指向下一个空闲页
+struct run
+{
+    struct run* next;
+};
+// 全局内存管理结构，地址为：0x00000000800088c0
+// 其中freelist永远指向下一个空闲列表
+struct
+{
+    struct spinlock lock;
+    struct run*     freelist;
+} kmem;
+
+// 初始化内存分配器，将从end开始到PHYSTOP结束的地址加入kmem管理
+// 其中KERNBASE=0x80000000L，PHYSTOP=(KERNBASE + 128 * 1024 * 1024)
+void kinit()
+{
+    initlock(&kmem.lock, "kmem");
+    freerange(end, (void*)PHYSTOP);
+}
+
+// 从 pa_start 到 pa_end，以页为单位（PGSIZE=4096）调用 kfree() 释放内存。
+void freerange(void* pa_start, void* pa_end)
+{
+    char* p;
+    p = (char*)PGROUNDUP((uint64)pa_start);
+    for (; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+        kfree(p);
+}
+
+// 将空闲页加入kmem的freelist管理
+void kfree(void* pa)
+{
+    struct run* r;
+
+    if (((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+        panic("kfree");
+    // 加入freelist时页全部填充1
+    memset(pa, 1, PGSIZE);
+
+    r = (struct run*)pa;
+
+    acquire(&kmem.lock);
+    r->next       = kmem.freelist;
+    kmem.freelist = r;
+    release(&kmem.lock);
+}
+
+// 从freelist中分配一个空闲页
+void* kalloc(void)
+{
+    struct run* r;
+
+    acquire(&kmem.lock);
+    r = kmem.freelist;
+    if (r)
+        kmem.freelist = r->next;
+    release(&kmem.lock);
+    // 从freelist申请到页时全部填充5
+    if (r)
+        memset((char*)r, 5, PGSIZE);
+    return (void*)r;
+}
+```
+mian.c文件中的`kinit()`函数，将剩余的内存从end到PHYSTOP的物理内存都纳入kmem数据结构管理了。
+
+### 3.2 内核页表创建
+
+在 xv6（基于 RISC-V Sv39 模式，虚拟地址空间最大为 2^39 字节）的内核地址空间中，内存被划分为四个主要部分，通过内核页表（由 `kvmmake` 创建）进行虚拟到物理地址的映射。
+
+1. **外设映射**：
+   - 包括 UART（串口）、Virtio（磁盘接口）和 PLIC（中断控制器）的内存映射 I/O 区域。
+   - UART 和 Virtio 各占一页（4KB），映射到其物理地址（如 `UART0`、`VIRTIO0`），权限为可读可写（`PTE_R | PTE_W`）。
+   - PLIC 映射范围较大（4MB），从物理地址 `PLIC` 开始，权限同样为可读可写。
+   - 这些外设的虚拟地址与物理地址相同（直接映射），地址由硬件定义，通常不连续。
+   - **作用**：允许内核通过虚拟地址直接访问硬件设备，如串口输出和中断处理。
+
+2. **内核代码段**：
+   - 从 `KERNBASE`（通常为 0x80000000）到 `etext`，对应内核 ELF 文件的代码段（`.text`）。
+   - 权限设置为可读可执行（`PTE_R | PTE_X`），禁止写入以防止代码被意外修改。
+   - 采用直接映射（虚拟地址 = 物理地址）。
+   - **作用**：存储内核的可执行指令，确保内核逻辑安全运行。
+
+3. **内核数据和动态内存**：
+   - 从 `etext` 到 `PHYSTOP`（`KERNBASE + 128MB`），包括两部分：
+     - 内核 ELF 文件的只读数据（`.rodata`）、数据（`.data`）和未初始化数据（`.bss`），从 `etext` 到 `end`。
+     - 剩余物理内存（从 `end` 到 `PHYSTOP`），由 `kinit` 初始化为空闲页面，供 `kalloc` 动态分配（如页表页面、内核栈等）。
+   - 权限为可读可写（`PTE_R | PTE_W`），采用直接映射。
+   - **作用**：支持内核的数据存储和动态内存分配，允许内核访问所有物理内存。
+
+4. **Trampoline 和内核栈**：
+   - **Trampoline**：将 trampoline 代码（用于用户态到内核态的切换，如系统调用或中断处理）映射到高虚拟地址 `TRAMPOLINE`（接近 2^39），大小为 4KB，权限为可读可执行（`PTE_R | PTE_X`）。
+   - **内核栈**：为每个进程（最多 `NPROC` 个）分配一个 4KB 页面作为内核栈，映射到高虚拟地址区域（通常在 `TRAMPOLINE` 下方），权限为可读可写（`PTE_R | PTE_W`）。
+   - 这些页面由 `kalloc` 分配，映射由 `proc_mapstacks` 完成，虚拟地址与物理地址不同（非直接映射）。
+   - **作用**：Trampoline 提供统一的异常处理入口；内核栈为每个进程在内核态执行提供独立栈空间，防止栈冲突。
+
+**映射特点**：
+- 前三部分（外设、代码、数据/动态内存）采用直接映射（虚拟地址 = 物理地址），便于内核直接访问硬件和内存。
+- 第四部分（trampoline 和内核栈）映射到高虚拟地址，与物理地址不同，确保与用户地址空间隔离。
+- 所有映射通过 `kvmmake` 在内核页表中设置，依赖 `kalloc` 分配物理页面，`walk` 定位页表项。
+
+![alt text](<内核地址空间与物理地址空间.png>)
+
+**(1) kvmmake**
+主要作用是创建一个内核地址空间的页表（Page Table），并将各种硬件设备、内核代码和数据映射到虚拟地址空间。
+```c
+pagetable_t kvmmake(void)
+{
+    // 使用 kalloc() 申请一个页表根目录
+    pagetable_t kpgtbl;
+    kpgtbl = (pagetable_t)kalloc();
+    memset(kpgtbl, 0, PGSIZE);
+    // UART0 映射
+    kvmmap(kpgtbl, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+    // VIRTIO0 映射
+    kvmmap(kpgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+    // PLIC 映射
+    kvmmap(kpgtbl, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+    // 代码段映射
+    kvmmap(kpgtbl, KERNBASE, KERNBASE, (uint64)etext - KERNBASE, PTE_R | PTE_X);
+    // 数据段和剩余物理空间映射
+    kvmmap(kpgtbl, (uint64)etext, (uint64)etext, PHYSTOP - (uint64)etext, PTE_R | PTE_W);
+    // TRAMPOLINE映射
+    kvmmap(kpgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+    // 内核栈申请以及映射
+    proc_mapstacks(kpgtbl);
+    return kpgtbl;
+}
+```
+(2)kvmmap/mappages函数
+kvmmap函数调用mappages函数实现内存映射，kvmmap加了一层出错验证。
+```c
+void kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
+{
+    if (mappages(kpgtbl, va, sz, pa, perm) != 0)
+        panic("kvmmap");
+}
+```
+mappages() 函数的作用是在页表中建立一段连续的虚拟地址到物理地址的映射。它会为每个虚拟页找到对应的页表项（PTE），并设置相应的物理地址和权限位。
+```c
+int mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+{
+    // 确保映射大小非零
+    if (size == 0)
+        panic("mappages: size");
+    // 计算映射的起始页地址和末端页地址（向下4k对齐）
+    uint64 a    = PGROUNDDOWN(va);
+    uint64 last = PGROUNDDOWN(va + size - 1);
+    // 循环映射页面(last-a)/PGSIZE次
+    pte_t* pte;
+    for (;;)
+    {
+        // 查找虚拟地址 a 对应的 L0 级页表项
+        if ((pte = walk(pagetable, a, 1)) == 0)
+            return -1;
+        // 检查页表项是否有效（PTE_V 标志置位）
+        if (*pte & PTE_V)
+            panic("mappages: remap");
+        // 构造页表项：物理地址+权限
+        *pte = PA2PTE(pa) | perm | PTE_V;
+        if (a == last)
+            break;
+        a += PGSIZE;
+        pa += PGSIZE;
+    }
+    return 0;
+}
+```
+
+**(3)walk函数**
+walk 函数根据给定的虚拟地址（va）在页表（pagetable）中查找对应的页表项（pte_t）。如果页表项不存在且允许分配（alloc 非零），则创建新的页面来扩展页表。
+- 39位虚拟地址分为3级索引（L2、L1、L0，每级 9 位）+ 12 位页面偏移
+    | 9 bits | 9 bits | 9 bits | 12 bits |
+    |--------|--------|--------|---------|
+    | VPN[2] | VPN[1] | VPN[0] | Offset  |
+
+- 页表项（PTE）：64 位，包含物理页面地址（PPN）和标志位
+    | 63-54 | 53-10 |  9-0  |
+    |-------|-------|-------|
+    |  保留  |  PPN  |  权限 |
+
+```c
+pte_t* walk(pagetable_t pagetable, uint64 va, int alloc)
+{
+    if (va >= MAXVA)
+        panic("walk");
+    // 逐级定位页表项，准备检查或创建下一级页表
+    for (int level = 2; level > 0; level--)
+    {
+        // 找页表项
+        pte_t* pte = &pagetable[PX(level, va)];
+        if (*pte & PTE_V)
+        {
+            pagetable = (pagetable_t)PTE2PA(*pte);
+        }
+        // 为空就申请物理空间填到页表项中
+        else
+        {
+            if (!alloc || (pagetable = (pde_t*)kalloc()) == 0)
+                return 0;
+            memset(pagetable, 0, PGSIZE);
+            *pte = PA2PTE(pagetable) | PTE_V;
+        }
+    }
+    // 返回最后一级页表的PTE项
+    return &pagetable[PX(0, va)];
+}
+```
+
+(4)kvminithart()
+开启当前硬件线程的分页机制，satp寄存器格式如下：
+| 63 | 62-60 | 59-44 | 43-0         |
+|----|-------|-------|--------------|
+| 1  | Mode  | ASID  | PPN          |
+- Bit 63：保留（通常为 0）。
+- Bits 62-60 (Mode)：分页模式，8（二进制 1000）表示 Sv39 模式（39 位虚拟地址，三级页表）。
+- Bits 59-44 (ASID)：地址空间标识符（Address Space Identifier），xv6 未使用，设为 0。
+- Bits 43-0 (PPN)：页表顶级页目录的物理页面号（Physical Page Number，物理地址右移 12 位）。
+```c
+#define SATP_SV39 (8L << 60)
+#define MAKE_SATP(pagetable) (SATP_SV39 | (((uint64)pagetable) >> 12))
+void kvminithart()
+{
+    // 刷新 TLB，清除旧的地址转换缓存
+    sfence_vma();
+    // 设置stap开启分页机制
+    w_satp(MAKE_SATP(kernel_pagetable));
+    // 刷新 TLB，清除旧的地址转换缓存
+    sfence_vma();
+}
+```
+
+### 3.3 用户页表创建
