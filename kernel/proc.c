@@ -61,7 +61,7 @@ void procinit(void)
     {
         initlock(&p->lock, "proc");
         p->state = UNUSED;
-        // 绑定栈的虚拟地址
+        // 绑定进程栈的虚拟地址
         p->kstack = KSTACK((int)(p - proc));
     }
 }
@@ -277,7 +277,6 @@ int growproc(int n)
     sz = p->sz;
     if (n > 0)
     {
-
         if ((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0)
         {
             return -1;

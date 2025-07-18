@@ -984,4 +984,224 @@ void kvminithart()
 }
 ```
 
-### 3.3 用户页表创建
+### 3.3 第一个用户进程以及用户页表
+
+在main文件中，userinit创建了第一个用户进程，同时也创建了第一个用户页表，
+(1) 进程数据结构及初始化
+内核文件在刚开始的时候就创建了进程的数据结构在.bss段，其具体的结构如下：
+```c
+struct proc
+{
+    // 保护进程的关键字段
+    struct spinlock lock;
+
+    // 访问或修改以下属性时需持有 p->lock
+    enum procstate state;    // 进程状态
+    void*          chan;     // 睡眠通道
+    int            killed;   // 终止标志
+    int            xstate;   // 退出状态
+    int            pid;      // 进程ID
+
+    // 访问或修改 parent 时需持有全局 wait_lock
+    struct proc* parent;   // 父进程指针
+
+    // 进程私有字段，访问或修改无需进程锁 p->lock
+    uint64            kstack;          // 内核栈的虚拟地址
+    uint64            sz;              // 进程虚拟地址空间范围
+    pagetable_t       pagetable;       // 用户页表根目录
+    struct trapframe* trapframe;       // 用户态寄存器和内核的栈、页表：内核态和用户态切换
+    struct context    context;         // 存储进程的内核态寄存器：进程切换
+    struct file*      ofile[NOFILE];   // 打开的文件
+    struct inode*     cwd;             // 当前工作目录
+    char              name[16];        // 进程名称
+};
+```
+`procinit`在系统启动时被调用，为进程管理子系统做准备
+```c
+void procinit(void)
+{
+    struct proc* p;
+    // 1. 初始化全局锁
+    initlock(&pid_lock, "nextpid");
+    initlock(&wait_lock, "wait_lock");
+    // 2. 遍历所有可能的进程槽
+    for (p = proc; p < &proc[NPROC]; p++)
+    {
+        // 3. 初始化进程特定的锁
+        initlock(&p->lock, "proc");
+        // 4. 设置进程状态为未使用
+        p->state = UNUSED;
+        // 5. 设置内核栈虚拟地址
+        p->kstack = KSTACK((int)(p - proc));
+    }
+}
+```
+
+(2) 创建并初始化第一个用户进程
+创建第一个用户进程的关键函数 userinit。它在内核启动的最后阶段被调用，负责初始化系统的第一个用户进程（init 进程）
+```c
+void userinit(void)
+{
+    // 分配进程结构，准备用户页表和内核栈
+    struct proc* p;
+    p        = allocproc();
+    initproc = p;
+
+    // 分配一个物理页映射虚拟地址0，并将initcode二进制数据复制到该页
+    uvmfirst(p->pagetable, initcode, sizeof(initcode));
+    p->sz = PGSIZE;
+
+    // 准备用户态执行环境
+    p->trapframe->epc = 0;        // 用户程序入口地址（0x0）
+    p->trapframe->sp  = PGSIZE;   // 用户栈指针（地址0x1000）
+
+    // 设置进程元数据：进程名、工作路径、状态
+    safestrcpy(p->name, "initcode", sizeof(p->name));   
+    p->cwd   = namei("/");                              
+    p->state = RUNNABLE;                                
+    release(&p->lock);
+}
+```
+`userinit`函数初始化了第一个用户进程，而`allocproc`函数就是具体的执行者，为新进程的创建（如 userinit 创建第一个用户进程）提供基础。从全局进程表 proc[NPROC] 中分配一个未使用的进程槽，然后初始化进程pid、申请trapframe物理页、创建用户页表并映射trampoline和trapframe页、初始化内核上下文。
+```c
+static struct proc* allocproc(void)
+{
+    // 遍历查找一个未使用的进程槽，找到后持有进程锁
+    struct proc* p;
+    for (p = proc; p < &proc[NPROC]; p++)
+    {
+        acquire(&p->lock);
+        if (p->state == UNUSED)
+        {
+            goto found;
+        }
+        else
+        {
+            release(&p->lock);
+        }
+    }
+    return 0;
+
+found:
+    // 初始化pid并修改状态（带锁）
+    p->pid   = allocpid();
+    p->state = USED;
+
+    // 分配一个物理页给trapframe页，准备存储用户态上下文
+    if ((p->trapframe = (struct trapframe*)kalloc()) == 0)
+    {
+        freeproc(p);
+        release(&p->lock);
+        return 0;
+    }
+
+    // 创建用户页表，分配顶级页目录并映射必要区域
+    p->pagetable = proc_pagetable(p);
+    if (p->pagetable == 0)
+    {
+        freeproc(p);
+        release(&p->lock);
+        return 0;
+    }
+
+    // 初始化内核上下文，设置返回地址（forkret）和进程内核栈
+    memset(&p->context, 0, sizeof(p->context));
+    p->context.ra = (uint64)forkret;
+    p->context.sp = p->kstack + PGSIZE;
+
+    return p;
+}
+```
+proc_pagetable函数是根据进程槽指针创建页表，并映射trampoline和trapframe这两个关键页。
+```c
+pagetable_t proc_pagetable(struct proc* p)
+{
+    pagetable_t pagetable;
+    // uvmcreate是申请一个物理页成为顶级用户页表
+    pagetable = uvmcreate();
+    if (pagetable == 0)
+        return 0;
+
+    // 映射trampoline到用户地址空间最高地址TRAMPOLINE
+    if (mappages(pagetable, TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R | PTE_X) < 0)
+    {
+        uvmfree(pagetable, 0);
+        return 0;
+    }
+
+    // 映射p->trapframe到用户地址空间次高地址TRAPFRAME
+    if (mappages(pagetable, TRAPFRAME, PGSIZE, (uint64)(p->trapframe), PTE_R | PTE_W) < 0)
+    {
+        // 如果失败了就解除页表的trampoline映射
+        uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+        uvmfree(pagetable, 0);
+        return 0;
+    }
+    return pagetable;
+}
+```
+
+内核上下文结构`struct context`如下所示：
+```c
+struct context
+{
+    uint64 ra;    // 返回地址寄存器 (Return Address)
+    uint64 sp;    // 栈指针寄存器 (Stack Pointer)
+
+    // 被调用者保存寄存器 (Callee-saved registers)
+    uint64 s0;
+    uint64 s1;
+    uint64 s2;
+    uint64 s3;
+    uint64 s4;
+    uint64 s5;
+    uint64 s6;
+    uint64 s7;
+    uint64 s8;
+    uint64 s9;
+    uint64 s10;
+    uint64 s11;
+};
+```
+在`allocproc`中将进程的context的返回地址寄存器设置成forkret，栈指针寄存器设置成内核物理地址`p->kstack + PGSIZE`。这样在进程调度时候返回的地址是forkret。其中forkret函数如下：
+```c
+void forkret(void)
+{
+    // 如果是第一个进程就初始化文件系统和日志系统
+    static int first = 1;
+    release(&myproc()->lock);
+
+    if (first)
+    {
+        first = 0;
+        fsinit(ROOTDEV);
+    }
+    // 返回usertrapret准备返回用户态
+    usertrapret();
+}
+```
+调用`usertrapret`准备返回用户态，将内核进程的一些状态保存在trapframe页，并设置pc=p->trapframe->epc=0，然后调用`userret`返回用户态，从设置虚拟地址0开始执行initcode代码。其中initcode反汇编之后大致如下所示：
+```
+auipc a0, 0        # 将当前 PC 存入 a0
+addi a0, a0, 36    # a0 += 36 (指向 "/init" 字符串)
+auipc a1, 0        # 将当前 PC 存入 a1
+addi a1, a1, 35    # a1 += 35 (指向参数数组)
+li a7, SYS_exec    # 系统调用号 7 (exec)
+ecall              # 执行系统调用
+li a7, SYS_fork    # 系统调用号 2 (fork)
+ecall              # 执行系统调用
+jmp -16            # 跳回前面的 ecall (形成循环)
+.string "/init"    # 要执行的程序路径
+```
+这个代码的意思是尝试执行 /init 程序，如果失败则尝试 fork 后再次执行，循环直到成功启动 init 进程。至此，第一个用户进程启动!
+
+#### 总结：第一个用户进程启动的流程
+
+1. procinit 初始化进程表（lock、state = UNUSED、kstack）。
+2. userinit 调用 allocproc，分配进程槽，设置 pid、state = USED、trapframe、pagetable、context。
+3. proc_pagetable 创建用户页表，映射 TRAMPOLINE 和 TRAPFRAME。
+4. uvmfirst 映射 initcode 到虚拟地址 0，设置 sz = PGSIZE。
+5. userinit 设置用户态上下文（epc = 0、sp = PGSIZE）、元数据（name、cwd）、状态（RUNNABLE）。
+6. scheduler 运行 RUNNABLE 进程，通过 forkret 和 usertrapret 启动 initcode。
+
+### 3.4 一般进程的创建
